@@ -170,7 +170,7 @@ See [docs/migrating-a-site.md](docs/migrating-a-site.md).
 
 ## Urgent fix (CVE)
 
-Run the workflow by hand (Actions → build → Run workflow). Servers that watch the tags pick up the new image; otherwise redeploy.
+Run the workflow by hand (Actions → build → Run workflow). Servers that watch the tags pick up the new image (ours check at night, an urgent fix is rolled out by starting the watcher by hand); otherwise redeploy.
 
 ## Rollback of a site
 
