@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  exciting IT ImageMagick policy, copied over /etc/ImageMagick-*/policy.xml at build time.
+  Websites need raster images and, for WordPress' PDF previews, reading PDF (via Ghostscript).
+  PostScript, EPS and XPS are switched off: they are what exploits against Ghostscript use, and no
+  website needs them. Also off: coders that read URLs, local files or run ImageMagick scripts
+  (the "ImageTragick" class of attacks).
+-->
+<!DOCTYPE policymap [
+  <!ELEMENT policymap (policy)*>
+  <!ATTLIST policymap xmlns CDATA #FIXED ''>
+  <!ELEMENT policy EMPTY>
+  <!ATTLIST policy xmlns CDATA #FIXED '' domain NMTOKEN #REQUIRED
+    name NMTOKEN #IMPLIED pattern CDATA #IMPLIED rights NMTOKEN #IMPLIED
+    stealth NMTOKEN #IMPLIED value CDATA #IMPLIED>
+]>
+<policymap>
+  <!-- limits: a crafted image must not eat the server -->
+  <policy domain="resource" name="memory" value="512MiB"/>
+  <policy domain="resource" name="map" value="1GiB"/>
+  <policy domain="resource" name="area" value="128MP"/>
+  <policy domain="resource" name="disk" value="1GiB"/>
+  <policy domain="resource" name="width" value="16KP"/>
+  <policy domain="resource" name="height" value="16KP"/>
+  <policy domain="resource" name="time" value="120"/>
+
+  <!-- Ghostscript formats except PDF -->
+  <policy domain="coder" rights="none" pattern="{PS,PS2,PS3,EPS,EPSF,EPSI,EPI,EPT,EPT2,EPT3,XPS,PCL}"/>
+  <!-- PDF: read only (previews), never written -->
+  <policy domain="coder" rights="read" pattern="PDF"/>
+  <!-- no remote or local file access, no ImageMagick script formats -->
+  <policy domain="coder" rights="none" pattern="{URL,HTTP,HTTPS,FTP,MVG,MSL,TEXT,LABEL,SHOW,WIN,X,PLT}"/>
+  <policy domain="path" rights="none" pattern="@*"/>
+</policymap>

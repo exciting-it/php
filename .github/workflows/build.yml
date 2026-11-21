@@ -1,0 +1,154 @@
+# Builds ghcr.io/exciting-it/php:<version>-apache for every supported PHP version.
+#
+#   nightly    check first: rebuild only if the official php:<version>-apache changed (digest, recorded in the
+#              image label org.opencontainers.image.base.digest) or Debian has updates for packages in the
+#              published image. Nothing changed -> nothing is built or pushed, so servers don't restart sites.
+#   Saturday   full rebuild regardless (safety net, e.g. new PECL releases)
+#   push/PR    build and test (push to GHCR only from main)
+#   by hand    Actions -> build -> Run workflow (rebuilds by default)
+#
+# Every built image is tested (test/test.sh) before it is pushed. Trivy then scans the image that is live
+# (--ignore-unfixed, HIGH/CRITICAL) and reports to Security -> Code scanning and the run summary.
+# Actions are pinned to commit SHAs (version in the comment).
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "tools/**", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "tools/**", "LICENSE"]
+  schedule:
+    - cron: "30 2 * * *" # nightly check
+    - cron: "0 18 * * 6" # Saturday full rebuild
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if nothing changed"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write # upload Trivy results to code scanning
+  actions: read # needed by upload-sarif
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false # one PHP version failing must not stop the others
+      matrix:
+        php: ["8.2", "8.3", "8.4", "8.5"]
+    env:
+      PHP: ${{ matrix.php }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/php
+      LOCAL: php-test:${{ matrix.php }}
+      TRIVY: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+      EVENT: ${{ github.event_name }}
+      SCHEDULE: ${{ github.event.schedule }}
+      FORCE: ${{ inputs.force }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          base_digest=$(docker buildx imagetools inspect "php:$PHP-apache" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ $base_digest == sha256:* ]] || { echo "could not resolve php:$PHP-apache"; exit 1; }
+          reason=""
+          case $EVENT in
+            push | pull_request) reason=$EVENT ;;
+            workflow_dispatch) [[ $FORCE == true ]] && reason="manual run" ;;
+            schedule) [[ $SCHEDULE == "0 18 * * 6" ]] && reason="weekly full rebuild" ;;
+          esac
+          published=""
+          if docker pull -q "$IMAGE:$PHP-apache" >/dev/null 2>&1; then published=yes; fi
+          if [[ -z $reason ]]; then
+            if [[ -z $published ]]; then
+              reason="no published image yet"
+            else
+              built_on=$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' "$IMAGE:$PHP-apache")
+              if [[ $built_on != "$base_digest" ]]; then
+                reason="php:$PHP-apache changed (${built_on:0:19} -> ${base_digest:0:19})"
+              else
+                updates=$(docker run --rm --entrypoint sh "$IMAGE:$PHP-apache" -c \
+                  'apt-get update -qq >/dev/null 2>&1 && apt list --upgradable 2>/dev/null | grep -F "[upgradable" | cut -d/ -f1' | tr '\n' ' ')
+                [[ -n ${updates// /} ]] && reason="Debian updates: $updates"
+              fi
+            fi
+          fi
+          echo "base_digest=$base_digest" >>"$GITHUB_OUTPUT"
+          echo "published=$published" >>"$GITHUB_OUTPUT"
+          if [[ -n $reason ]]; then echo "build=true" >>"$GITHUB_OUTPUT"; else echo "build=false" >>"$GITHUB_OUTPUT"; fi
+          echo "### PHP $PHP: ${reason:-nothing changed, no build}" >>"$GITHUB_STEP_SUMMARY"
+          echo "PHP $PHP: ${reason:-nothing changed, no build}"
+
+      - name: Build PHP ${{ matrix.php }}
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+            BASE_IMAGE=php:${{ matrix.php }}-apache@${{ steps.decide.outputs.base_digest }}
+            BASE_DIGEST=${{ steps.decide.outputs.base_digest }}
+          pull: true
+          no-cache: true # newest Debian packages
+          load: true
+          tags: ${{ env.LOCAL }}
+
+      - name: Test
+        if: steps.decide.outputs.build == 'true'
+        run: bash test/test.sh "$LOCAL"
+
+      - name: Push
+        if: steps.decide.outputs.build == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          full=$(docker run --rm --entrypoint php "$LOCAL" -r 'echo PHP_VERSION;')
+          # 8.3-apache (moving, used by sites), 8.3.37-apache (moving within a patch release),
+          # 8.3.37-apache-20261121 (fixed, for rollback)
+          for tag in "$PHP-apache" "$full-apache" "$full-apache-$(date -u +%Y%m%d)"; do
+            docker tag "$LOCAL" "$IMAGE:$tag"
+            docker push -q "$IMAGE:$tag"
+          done
+          echo "pushed \`$IMAGE:$PHP-apache\` (PHP $full)" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Scan with Trivy
+        id: scan
+        if: steps.decide.outputs.build == 'true' || steps.decide.outputs.published == 'yes'
+        env:
+          BUILT: ${{ steps.decide.outputs.build }}
+        run: |
+          # the image that is live after this run: the fresh build if there was one, else the published one
+          target=$IMAGE:$PHP-apache
+          [[ $BUILT == true ]] && target=$LOCAL
+          mkdir -p "$HOME/.cache/trivy"
+          trivy() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              -v "$PWD:/work" -w /work "$TRIVY" image --quiet --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL "$@" "$target"
+          }
+          trivy --format sarif --output "trivy-$PHP.sarif"
+          {
+            echo "<details><summary>Trivy: fixable HIGH/CRITICAL in $target</summary>"
+            echo; echo '```'; trivy --skip-db-update --format table; echo '```'; echo "</details>"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scan to Security tab
+        if: steps.scan.outcome == 'success' && github.event_name != 'pull_request'
+        continue-on-error: true # code scanning needs a public repo (or GitHub Code Security)
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: trivy-${{ matrix.php }}.sarif
+          category: php-${{ matrix.php }}

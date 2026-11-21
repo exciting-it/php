@@ -1,0 +1,43 @@
+#!/bin/sh
+# Switches on the optional PHP extensions listed in PHP_EXTENSIONS (space or comma separated),
+# then hands over to the official entrypoint. Runs on every container start, so the list in the
+# environment is always the truth: removing a name switches the extension off again.
+# Unknown names are reported and ignored; a typo must not take the site down.
+set -eu
+
+avail=/usr/local/etc/php/available
+confd=/usr/local/etc/php/conf.d
+
+if [ -w "$confd" ]; then
+  rm -f "$confd"/00-ext-*.ini "$confd"/50-ext-*.ini
+  for ext in $(printf '%s' "${PHP_EXTENSIONS:-}" | tr ',' ' '); do
+    if [ -f "$avail/$ext.ini" ]; then
+      # ionCube and SourceGuardian must load before every other Zend extension (opcache)
+      case $ext in ioncube_loader | sourceguardian) prio=00 ;; *) prio=50 ;; esac
+      ln -s "$avail/$ext.ini" "$confd/$prio-ext-$ext.ini"
+    elif grep -qxF "$ext" /usr/local/etc/php/extensions-default.txt; then
+      : # always on anyway
+    else
+      echo "site-entrypoint: PHP extension '$ext' is not available in this image, ignored" >&2
+    fi
+  done
+elif [ -n "${PHP_EXTENSIONS:-}" ]; then
+  echo "site-entrypoint: $confd not writable (container not started as root), PHP_EXTENSIONS ignored" >&2
+fi
+
+# Apache prefork sizing (mpm_prefork.conf reads these). Invalid values fall back to the defaults;
+# the spare/start values are clamped so they never exceed APACHE_MAX_WORKERS.
+num() { # num <value> <default>: positive integer or the default
+  case $1 in '' | *[!0-9]* | 0) echo "$2" ;; *) echo "$1" ;; esac
+}
+min() { [ "$1" -lt "$2" ] && echo "$1" || echo "$2"; }
+w=$(num "${APACHE_MAX_WORKERS:-}" 25)
+[ "$w" = "${APACHE_MAX_WORKERS:-}" ] || echo "site-entrypoint: APACHE_MAX_WORKERS='${APACHE_MAX_WORKERS:-}' is not a positive number, using $w" >&2
+export APACHE_MAX_WORKERS="$w"
+export APACHE_START_SERVERS="$(min "$(num "${APACHE_START_SERVERS:-}" 2)" "$w")"
+export APACHE_MIN_SPARE="$(min "$(num "${APACHE_MIN_SPARE:-}" 1)" "$w")"
+export APACHE_MAX_SPARE="$(min "$(num "${APACHE_MAX_SPARE:-}" 5)" "$w")"
+[ "$APACHE_MAX_SPARE" -ge "$APACHE_MIN_SPARE" ] || APACHE_MAX_SPARE=$APACHE_MIN_SPARE
+export APACHE_MAX_CONNECTIONS_PER_CHILD="$(num "${APACHE_MAX_CONNECTIONS_PER_CHILD:-}" 1000)"
+
+exec docker-php-entrypoint "$@"
